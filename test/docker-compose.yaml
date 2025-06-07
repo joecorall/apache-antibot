@@ -1,0 +1,21 @@
+services:
+  apache:
+    image: mod_antibot:latest
+    build:
+      context: ..
+    ports:
+      - "8080:80"
+    volumes:
+      - ./conf/apache/index.html:/var/www/html/index.html
+      - ./conf/apache/challenge.html:/var/www/html/challenge.html
+      - ./conf/apache/antibot.conf:/etc/apache2/conf.d/antibot.conf
+
+  backend:
+    image: python:3.11-alpine
+    command:
+      - python
+      - /app/server.py
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./conf/antibot-backend/server.py:/app/server.py
