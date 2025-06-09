@@ -12,7 +12,6 @@
 module AP_MODULE_DECLARE_DATA antibot_module;
 
 typedef struct {
-    char *challenge_html_file;
     char *auth_backend_url;
     char *challenge_key;
 
@@ -25,10 +24,10 @@ typedef struct {
 static void *create_dir_config(apr_pool_t *pool, char *dir)
 {
     antibot_config *conf = apr_pcalloc(pool, sizeof(antibot_config));
-    conf->auth_backend_url = apr_pstrdup(pool, "http://auth-backend:8080");
+    conf->auth_backend_url = apr_pstrdup(pool, "http://antibot:8888");
     conf->challenge_key = apr_pstrdup(pool, "challenge");
 
-    char *default_url = "auth-backend:8080";
+    char *default_url = "antibot:8888";
     char *colon = strchr(default_url, ':');
     if (colon) {
         conf->backend_host = apr_pstrndup(pool, default_url, colon - default_url);
@@ -41,13 +40,6 @@ static void *create_dir_config(apr_pool_t *pool, char *dir)
     conf->backend_addr = NULL;
 
     return conf;
-}
-
-static const char *set_challenge_html_file(cmd_parms *cmd, void *cfg, const char *arg)
-{
-    antibot_config *conf = (antibot_config*)cfg;
-    conf->challenge_html_file = apr_pstrdup(cmd->pool, arg);
-    return NULL;
 }
 
 static const char *set_auth_backend_url(cmd_parms *cmd, void *cfg, const char *arg)
@@ -95,49 +87,23 @@ static const char *set_challenge_key(cmd_parms *cmd, void *cfg, const char *arg)
 }
 
 static const command_rec antibot_cmds[] = {
-    AP_INIT_TAKE1("AntibotChallengeFile", set_challenge_html_file, NULL, ACCESS_CONF, "Path to HTML file"),
     AP_INIT_TAKE1("AntibotBackendUrl", set_auth_backend_url, NULL, ACCESS_CONF, "Backend URL"),
     AP_INIT_TAKE1("AntibotChallengeKey", set_challenge_key, NULL, ACCESS_CONF, "Challenge parameter key"),
     {NULL}
 };
 
-static char *read_html_file(apr_pool_t *pool, const char *filename)
-{
-    apr_file_t *file;
-    apr_finfo_t finfo;
-    apr_status_t rv;
-    char *content;
-    apr_size_t bytes_read;
-
-    if (!filename) return NULL;
-
-    rv = apr_stat(&finfo, filename, APR_FINFO_SIZE, pool);
-    if (rv != APR_SUCCESS) return NULL;
-
-    rv = apr_file_open(&file, filename, APR_READ, APR_OS_DEFAULT, pool);
-    if (rv != APR_SUCCESS) return NULL;
-
-    content = apr_palloc(pool, finfo.size + 1);
-    bytes_read = finfo.size;
-
-    rv = apr_file_read(file, content, &bytes_read);
-    apr_file_close(file);
-
-    if (rv == APR_SUCCESS) {
-        content[bytes_read] = '\0';
-        return content;
-    }
-
-    return NULL;
-}
-
-static int make_backend_request(request_rec *r, antibot_config *conf, int is_challenge)
+static int make_backend_request(request_rec *r, antibot_config *conf, int is_challenge, char **out_body)
 {
     apr_socket_t *sock;
     apr_status_t rv;
+    char buffer[8192];
+    apr_size_t len;
+    int code = 500;
+
+    *out_body = NULL;
 
     if (!conf->backend_addr) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Backend address not resolved");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Backend address not resolved: %s", conf->backend_host);
         return 500;
     }
 
@@ -151,25 +117,23 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
     rv = apr_socket_connect(sock, conf->backend_addr);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "Failed to connect to backend %s:%d",
-                    conf->backend_host, conf->backend_port);
+                      conf->backend_host, conf->backend_port);
         apr_socket_close(sock);
         return 500;
     }
 
     const char *http_method = is_challenge ? "POST" : "GET";
-    const char *path = conf->backend_path && strlen(conf->backend_path) > 0 ? conf->backend_path : "/";
 
     const char *req = apr_psprintf(r->pool,
         "%s / HTTP/1.1\r\n"
         "X-Forwarded-For: %s\r\n"
-        // TODO: performance improvement - reuse tcp connections
         "Connection: close\r\n"
         "\r\n",
         http_method,
         r->connection->client_ip
     );
 
-    apr_size_t len = strlen(req);
+    len = strlen(req);
     rv = apr_socket_send(sock, req, &len);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "Failed to send request to backend");
@@ -177,27 +141,47 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
         return 500;
     }
 
-    char response_line[256] = {0};
-    len = sizeof(response_line) - 1;
-    rv = apr_socket_recv(sock, response_line, &len);
-    apr_socket_close(sock);
+    // Read response into buffer
+    char *response = apr_pcalloc(r->pool, 65536);  // Max 64k response
+    char *resp_ptr = response;
+    apr_size_t total_len = 0;
 
-    if (rv != APR_SUCCESS && rv != APR_EOF) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "Failed to receive response from backend");
-        return 500;
-    }
-
-    response_line[len] = '\0';
-
-    // Parse status code
-    int code = 500;
-    if (strncmp(response_line, "HTTP/", 5) == 0) {
-        if (sscanf(response_line, "HTTP/%*s %d", &code) != 1) {
-            code = 500;
+    while (1) {
+        len = sizeof(buffer);
+        rv = apr_socket_recv(sock, buffer, &len);
+        if (rv != APR_SUCCESS && rv != APR_EOF) {
+            break;
+        }
+        if (len == 0) {
+            break;
+        }
+        memcpy(resp_ptr, buffer, len);
+        resp_ptr += len;
+        total_len += len;
+        if (rv == APR_EOF) {
+            break;
         }
     }
 
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Backend response: %d", code);
+    apr_socket_close(sock);
+
+    // Null-terminate
+    response[total_len] = '\0';
+
+    // Parse status code from response
+    if (strncmp(response, "HTTP/", 5) == 0) {
+        sscanf(response, "HTTP/%*s %d", &code);
+    }
+
+    // Find start of body
+    char *body_start = strstr(response, "\r\n\r\n");
+    if (body_start) {
+        body_start += 4; // skip past \r\n\r\n
+        *out_body = apr_pstrdup(r->pool, body_start);
+    } else {
+        *out_body = apr_pstrdup(r->pool, "<html><body>Invalid response from backend</body></html>");
+    }
+
     return code;
 }
 
@@ -223,7 +207,7 @@ const char* get_query_param(const char *args, const char *key)
 static int antibot_handler(request_rec *r)
 {
     antibot_config *conf = ap_get_module_config(r->per_dir_config, &antibot_module);
-    if (!conf || !conf->challenge_html_file || !conf->auth_backend_url) {
+    if (!conf || !conf->backend_addr) {
         return DECLINED;
     }
 
@@ -245,7 +229,8 @@ static int antibot_handler(request_rec *r)
         return OK;
     }
 
-    backend_response = make_backend_request(r, conf, is_challenge);
+    char *response_body = NULL;
+    backend_response = make_backend_request(r, conf, is_challenge, &response_body);
     switch (backend_response) {
         case HTTP_OK:
             return OK;
@@ -253,20 +238,9 @@ static int antibot_handler(request_rec *r)
         case HTTP_TOO_MANY_REQUESTS:
             r->content_type = "text/html";
             r->status = backend_response;
-
-            html_content = read_html_file(r->pool, conf->challenge_html_file);
-            if (!html_content) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                            "Antibot: Failed to read challenge HTML file: %s",
-                            conf->challenge_html_file ? conf->challenge_html_file : "(null)");
-                r->status = HTTP_INTERNAL_SERVER_ERROR;
-                return DONE;
-            }
-
-            ap_set_content_length(r, strlen(html_content));
-
+            ap_set_content_length(r, strlen(response_body));
             if (!r->header_only) {
-                ap_rputs(html_content, r);
+                ap_rputs(response_body, r);
             }
 
             return DONE;

@@ -5,4 +5,7 @@ test: build
 	docker compose -f test/docker-compose.yaml up -d
 	bash ./test/run.sh
 
-.PHONY: build test
+clean:
+	docker compose -f test/docker-compose.yaml down
+
+.PHONY: build test clean
