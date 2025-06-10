@@ -126,10 +126,12 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
 
     const char *req = apr_psprintf(r->pool,
         "%s / HTTP/1.1\r\n"
+        "Host: %s\r\n"
         "X-Forwarded-For: %s\r\n"
         "Connection: close\r\n"
         "\r\n",
         http_method,
+        conf->backend_host,
         r->connection->client_ip
     );
 
