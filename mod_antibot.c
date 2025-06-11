@@ -144,6 +144,7 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
             }
         }
 
+        const char *content_type = apr_table_get(r->headers_in, "Content-Type");
         const char *req_headers = apr_psprintf(r->pool,
             "POST / HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -155,7 +156,7 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
             conf->backend_host,
             r->connection->client_ip,
             (unsigned long)total,
-            r->content_type ? r->content_type : "application/octet-stream"
+            content_type ? content_type : "application/octet-stream"
         );
 
         len = strlen(req_headers);
