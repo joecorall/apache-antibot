@@ -96,7 +96,6 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
 {
     apr_socket_t *sock;
     apr_status_t rv;
-    char buffer[8192];
     apr_size_t len;
     int code = 500;
 
@@ -122,21 +121,70 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
         return 500;
     }
 
-    const char *http_method = is_challenge ? "POST" : "GET";
+    if (is_challenge) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "POSTing");
 
-    const char *req = apr_psprintf(r->pool,
-        "%s / HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "X-Forwarded-For: %s\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        http_method,
-        conf->backend_host,
-        r->connection->client_ip
-    );
+        int rc = ap_setup_client_block(r, REQUEST_CHUNKED_ERROR);
+        if (rc != OK) {
+            return 502;
+        }
 
-    len = strlen(req);
-    rv = apr_socket_send(sock, req, &len);
+        apr_size_t total = 0;
+        apr_pool_t *pool = r->pool;
+        apr_size_t max_body = 65536;  // Max 64k POST body
+        char *body = apr_palloc(pool, max_body);
+        if (ap_should_client_block(r)) {
+            char b[8192];
+            long readlen;
+            while ((readlen = ap_get_client_block(r, b, sizeof(b))) > 0) {
+                if (total + (apr_size_t)readlen > max_body) {
+                    return HTTP_REQUEST_ENTITY_TOO_LARGE;
+                }
+
+                memcpy(body + total, b, (apr_size_t)readlen);
+                total += (apr_size_t)readlen;
+            }
+        }
+
+        const char *req_headers = apr_psprintf(r->pool,
+            "POST / HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "X-Forwarded-For: %s\r\n"
+            "Content-Length: %lu\r\n"
+            "Content-Type: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            conf->backend_host,
+            r->connection->client_ip,
+            (unsigned long)total,
+            r->content_type ? r->content_type : "application/octet-stream"
+        );
+
+        len = strlen(req_headers);
+        apr_status_t hr = apr_socket_send(sock, req_headers, &len);
+        if (hr != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "Failed to send POST headers to backend");
+            apr_socket_close(sock);
+            return 500;
+        }
+
+        // send the client's POST body to the backend
+        rv = apr_socket_send(sock, body, &total);
+    } else {
+        const char *req = apr_psprintf(r->pool,
+            "GET / HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "X-Forwarded-For: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            conf->backend_host,
+            r->connection->client_ip
+        );
+
+        len = strlen(req);
+        rv = apr_socket_send(sock, req, &len);
+    }
+
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "Failed to send request to backend");
         apr_socket_close(sock);
@@ -144,6 +192,7 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
     }
 
     // Read response into buffer
+    char buffer[8192];
     char *response = apr_pcalloc(r->pool, 65536);  // Max 64k response
     char *resp_ptr = response;
     apr_size_t total_len = 0;
@@ -235,7 +284,10 @@ static int antibot_handler(request_rec *r)
     backend_response = make_backend_request(r, conf, is_challenge, &response_body);
     switch (backend_response) {
         case HTTP_OK:
-            return OK;
+            // if this was a GET request, have apache continue processing the request
+            if (is_challenge == 0 || strlen(response_body) == 0) {
+                return OK;
+            }
         case HTTP_FORBIDDEN:
         case HTTP_TOO_MANY_REQUESTS:
             r->content_type = "text/html";

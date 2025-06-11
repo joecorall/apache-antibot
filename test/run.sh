@@ -32,7 +32,10 @@ curl -XPOST -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/protected 
 curl -XPOST -s -o /dev/null -w "%{http_code}\n" "http://localhost:8080/protected?challenge_no=1" | grep -q 404 \
   || (echo "POST to a protected path with non-challenge key should 404" && exit 1)
 
-curl -XPOST -s -o /dev/null -w "%{http_code}\n" "http://localhost:8080/protected?challenge=1" | grep -q 403 \
-  || (echo "POST to a protected path with challenge key should 403" && exit 1)
+curl -XPOST -s -d '{"foo": "bar"}' "http://localhost:8080/protected?challenge=1" | jq -e .foo > /dev/null \
+  || (echo "POST to a protected path with challenge key should print the request body" && exit 1)
+
+curl -XPOST -s -o /dev/null -w "%{http_code}\n" "http://localhost:8080/protected?challenge=1" | grep -q 404 \
+  || (echo "POST to a protected path with challenge key and no body should 404" && exit 1)
 
 echo "Tests passed 🚀"
