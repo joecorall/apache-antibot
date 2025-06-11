@@ -122,8 +122,6 @@ static int make_backend_request(request_rec *r, antibot_config *conf, int is_cha
     }
 
     if (is_challenge) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "POSTing");
-
         int rc = ap_setup_client_block(r, REQUEST_CHUNKED_ERROR);
         if (rc != OK) {
             return 502;
